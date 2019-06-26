@@ -1,223 +1,125 @@
 /** Drives a Powerlink timer box
-   Author:    Kirk Kratzmann
-   Version:   1.0
-   Date:      24/06/2019
-*/
+ * Author:    Kirk Kratzmann John McKeown
+ * Version:   1.0
+ * Date:      24/06/2019
+ */
 
-/** System Functionality **
-
-** System Harwdare Summary **
-   System consists of:
-
-   The main program:-
-
-   Normal operation the diagnostic led fashes on and off every second
-*/
+/** System Functionality **/
+/*
+ *  The main program loop:
+ *  Flashes the onboard led on and off every second.
+ *  Reads the position of the rotary switch and if valid position calls the appropriate mode processing code.
+ *  If no valid position for the rotary switch, it is ignored.
+ *  If the rotary switch position is moved, the current mode processing is aborted and the relay de-energised.
+ *  If the rotary switch is moved while holding down the plug in switch,
+ *  the current mode processing is aborted and a new operation is started immediately.
+ *  Note: all inputs are active when input signal is grounded.
+ *
+ *  There is debug code (defined by macros) used to debug software by printing out selected variables to the serial monitor.
+ *  These macros are normally blank, for them to work the token "DEBUG_CODE" has to defined in PowerLink.h
+ *
+ *  There is a simple hardware diagnostic used to test the digital and analogue input wiring.
+ *  The code periodically prints out the state of the digtal and anlogue inputs to the serial monitor
+ *  This code is only called if the Digital input 12 is grounded.
+ */
 
 #include "PowerLink.h"
 
-uint8_t onBoardLedState = LOW;           //state of led, initially off
-unsigned long ledFlashCounter = 0;       //used to count time until flash led
+int onBoardLedState{LOW};           //state of led, initially off
+long ledFlashCounter{0};        //used to count time until flash led
 
-unsigned int mode = DIRECT_MODE;    //mode selected by rotary switch, initial value is arbitary
-boolean relayEnergised = false;     //true if relay is energised false if not energised
+int mode{INVALID_MODE};         //mode selected by rotary switch, initial value is invalid so forces a change at startup
 
-boolean firstButtonPush = false;          //Used in latch mode to track button pushes
-boolean waitingSecondButtonPush = false;  //Used in latch mode to track button pushes
-boolean secondButtonPush = false;         //Used in latch mode to track button pushes
+boolean firstButtonPush{false};          //Used in latch mode to track button pushes
+boolean waitingSecondButtonPush{false};  //Used in latch mode to track button pushes
+boolean secondButtonPush{false};         //Used in latch mode to track button pushes
 
-int plugInSwitchState;             // the current reading from the plug In Switch
-int lastplugInSwitchState = LOW;   // the previous reading from the plug In Switch
+int plugInSwitchPreviousValue{0};        //Previous value of the plug In Switch
 
-// the following variables are unsigned longs because the time, measured in
-// milliseconds, will quickly become a bigger number than can be stored in an int.
-unsigned long lastDebounceTime = 0;  // the last time the output pin was toggled
-unsigned long debounceDelay = 50;    // the debounce time
+long userRequestedTime{0L};      //time requested by the user in timed modes
+long timerStartTime{0L};         //time when user timer started in milliseconds in timed modes
 
-
-unsigned long userRequestedTime = 0;
-unsigned long timerStartTime = 0;
 
 /** Setup **/
 void setup(void)
 {
-  /* set up inputs using internal pull up resistors and set up outputs */
+  /* set up inputs using internal pull up resistors */
+  pinMode(rotarySwitchDirectPin, INPUT_PULLUP);
+  pinMode(rotarySwitchTimedSecondsPin, INPUT_PULLUP);
+  pinMode(rotarySwitchTimedMinutesPin, INPUT_PULLUP);
+  pinMode(rotarySwitchLatchPin, INPUT_PULLUP);
+  pinMode(plugInButtonPin, INPUT_PULLUP);
+  pinMode(runHwDiagnosticsPin, INPUT_PULLUP);
+
+  /* set up outputs */
   pinMode(onBoardLedPin, OUTPUT);
   digitalWrite(onBoardLedPin, HIGH);       //sets the LED on
-
-  pinMode(userLedPin, OUTPUT);
-  digitalWrite(userLedPin, LOW);            //sets the LED to off
 
   pinMode(relayDriverPin, OUTPUT);
   digitalWrite(relayDriverPin, LOW);        //turn off the relay
 
-  Serial.begin(38400);      //set up serial port for any debug prints
+  //display startup message if debuging is defined
+  Serial.begin(38400L);
+  DEBUGPRINT_STARTUP;
+
   return;
 }//end of setup()
 
 
 /** Main Loop **/
 void loop(void) {
+  //flash the led once a second to show something is happening
+  flashLed(1000);
 
-  //flash the led with period of one second, to show something is happening
-  if (millis() - ledFlashCounter >= 500) {
-    toggleLed();
-    ledFlashCounter = millis();
-  }
+  //only run hardware diagnostics if pin is grounded
+  if (!digitalRead(runHwDiagnosticsPin))
+    diagnostics();
 
   //check if mode switch position has changed
-  unsigned int newMode = getRotarySwitchPosition();
-  if (mode != newMode) {
-    //switch position has changed, abort everything
-    mode = newMode;
+  if (mode != getRotarySwitchPosition()) {
+    //switch position has changed, abort everything, save the new mode
+    mode = getRotarySwitchPosition();
     de_energiseRelay();
-    //clear flags in a seperate function, so any changes done in the one place
     clearFlags();
+    //display mode on serial port if debuging is defined
+    DEBUGPRINT_MODE(mode);
   }
 
-  if (mode == LATCH_MODE) {
-    boolean buttonPosition = getPlugInButtonPosition();
-    //check if first press of the button, if so energise the relay
-    if (!firstButtonPush && buttonPosition) {
-      firstButtonPush = true;
-      energiseRelay();
-    }
+  // check which mode and process it
+  switch (mode) {
+    case LATCH_MODE:
+      processLatchMode();
+      break;
 
-    //check if button released after first press of the button, if so set flag to say wait second button
-    if (firstButtonPush && !buttonPosition) {
-      waitingSecondButtonPush = true;
-    }
+    case DIRECT_MODE:
+      processDirectMode();
+      break;
 
-    //check if second press of the button, if so de-energise the relay
-    if (waitingSecondButtonPush && buttonPosition) {
-      secondButtonPush = true;
-      de_energiseRelay();
-    }
+    case TIMEDSECONDS_MODE:
+      processTimedMode(1);   //function requires a multiplier, so as in seconds use 1
+      break;
 
-    //check if button released after second press of the button, if so clear all flags
-    if (secondButtonPush && !buttonPosition) {
-      clearFlags();
-    }
+    case TIMEDMINUTES_MODE:
+      processTimedMode(60);   //function requires a multiplier, so as in minutes use 60
+      break;
 
-  } else if (mode == TIMEDSECONDS_MODE) {
-    //if not timing yet, and switched pressed, start timer
-    if (timerStartTime == 0ul && getPlugInButtonPosition()) {
-      //get how long user wants the timer to run for
-      userRequestedTime = getTimerSetting();
-      //get current time
-      timerStartTime = millis();
-      energiseRelay();
-    }
-    //check if timer running, and if so if timer has finished
-    if (timerStartTime != 0ul && (millis() - timerStartTime >= userRequestedTime)) {
-      //time expired
-      de_energiseRelay();
-      //wait until button is released before finishing, so doesn't start again
-      if (!getPlugInButtonPosition())
-        clearFlags();
-    }
-
-  } else if (mode == TIMEDMINUTES_MODE) {
-    //if not timing yet, and switched pressed, start timer
-    if (timerStartTime == 0ul && getPlugInButtonPosition()) {
-      //get how long user wants the timer to run for
-      userRequestedTime = getTimerSetting();
-      //as this is the minute timer, convert to minutes
-      userRequestedTime *= 60;
-      //get current time
-      timerStartTime = millis();
-      energiseRelay();
-    }
-    //check if timer running, and if so if timer has finished
-    if (timerStartTime != 0ul && (millis() - timerStartTime >= userRequestedTime)) {
-      //time expired
-      de_energiseRelay();
-      //wait until button is released before finishing, so doesn't start again
-      if (!getPlugInButtonPosition())
-        clearFlags();
-    }
-
-  } else if (mode == DIRECT_MODE) {
-    //if switch pressed, energise the relay otherwise de-energise the relay
-    if (getPlugInButtonPosition())
-      energiseRelay();
-    else {
-      de_energiseRelay();
-      clearFlags();
-    }
+      //ignore invalid values
   }
 }
 //end of loop(void)
 
 
-/** getRotarySwitchPosition() **/
-unsigned int getRotarySwitchPosition() {
-  return 0;
-}
-
-
-/** getPlugInButtonPosition() **/
-/* only returns the new state */
-
-boolean getPlugInButtonPosition() {
-
-  // read the state of the switch into a local variable:
-  int reading = digitalRead(plugInButtonPin);
-
-  // check to see if you just pressed the button
-  // (i.e. the input went from LOW to HIGH), and you've waited long enough
-  // since the last press to ignore any noise:
-
-  // If the switch changed, due to noise or pressing:
-  if (reading != lastplugInSwitchState) {
-    // reset the debouncing timer
-    lastDebounceTime = millis();
+/** flash led **/
+/*
+ * Period has to be in milliseconds
+ */
+void flashLed(int period) {
+  if (long (millis()) - ledFlashCounter >= long(period) / 2) {  //divide by 2, as on for half the period and off half the period
+    toggleLed();
+    ledFlashCounter = millis();
   }
-
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    // whatever the reading is at, it's been there for longer than the debounce
-    // delay, so take it as the actual current state:
-
-    // if the button state has changed:
-    if (reading != plugInSwitchState) {
-      plugInSwitchState = reading;
-    }
-  }
-
-  // save the reading. Next time through the loop, it'll be the lastButtonState:
-  lastplugInSwitchState = reading;
-
-  return plugInSwitchState;
 }
 
-
-/**  energiseRelay() **/
-void energiseRelay() {
-  relayEnergised = true;
-  digitalWrite(relayDriverPin, 1);
-}
-
-
-/**  de_energiseRelay() **/
-void de_energiseRelay() {
-  relayEnergised = false;
-  digitalWrite(relayDriverPin, 0);
-}
-
-
-/** clearFlags() **/
-void clearFlags() {
-  firstButtonPush = false;
-  waitingSecondButtonPush = false;
-  secondButtonPush = false;
-  userRequestedTime = 0ul;
-  timerStartTime = 0ul;
-}
-
-/**  getTimerSetting() **/
-int  getTimerSetting() {
-  return 0;
-}
 
 /** void toggleLed(void) **/
 void toggleLed(void) {
