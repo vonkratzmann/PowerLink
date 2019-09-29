@@ -1,6 +1,6 @@
 /** Functions to process selected mode of rotary switch and operation of plug in button **/
 
-#include "PowerLink.h"
+#include "Switchbox.h"
 
 /** processDirectMode() **/
 /*
